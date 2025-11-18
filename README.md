@@ -46,7 +46,7 @@
 ![ER Diagram](docs/images/er-diagram-logical.png)
 # Физическая модель
 
-![ER Diagram](docs/images/er-diagram-phiz.png)
+![ER Diagram](docs/images/er-diagram-phis.png)
 
 ### Таблица сотрудников
 - `id SERIAL PK`
