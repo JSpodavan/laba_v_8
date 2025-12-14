@@ -173,7 +173,7 @@ GROUP BY d.name
 ORDER BY d.name;
 ```
 
-![Запрос 1](docs/images/zapro1.png)
+![Запрос 1](docs/images/zapros1.png)
 ![Запрос 2](docs/images/zapros2.png)
 
 # Лабораторная работа №3
