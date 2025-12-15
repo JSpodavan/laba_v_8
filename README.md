@@ -729,137 +729,192 @@ WHERE e.children_count > 1;
 значительно повысить скорость выполнения SELECT-запросов,
 что подтверждено результатами EXPLAIN ANALYZE.
 
-# Лабораторная №5
+# Лабораторная №5 Триггеры и аудит
 
-### Индексы
+## Цель: Реализация бизнес-логики на уровне БД и системы аудита для учёта сотрудников и истории их назначений.
+
+### Задачи:
+
+Триггеры каскадного удаления сотрудников и их назначений
+Триггеры аудита изменений (INSERT, UPDATE, DELETE) назначений
+Создание таблицы-журнала для отслеживания изменений назначений
+
+1. Триггер каскадного удаления назначений при удалении сотрудника
 
 ```sql
-CREATE INDEX idx_emp_birth ON employee(birth_date);
-CREATE INDEX idx_assign_emp ON assignment(employee_id);
-CREATE INDEX idx_assign_dept ON assignment(department_id);
-```
-
-### Триггер предотвращающий пересечение периодов
-
-```sql
-CREATE OR REPLACE FUNCTION check_assignment_overlap()
-RETURNS TRIGGER AS $$
+-- Функция для каскадного удаления назначений сотрудника
+CREATE OR REPLACE FUNCTION mochalov2261.delete_assignments_cascade_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
 BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM assignment a
-        WHERE a.employee_id = NEW.employee_id
-          AND (NEW.end_date IS NULL OR a.start_date <= NEW.end_date)
-          AND (a.end_date IS NULL OR a.end_date >= NEW.start_date)
-          AND a.id <> NEW.id
-    ) THEN
-        RAISE EXCEPTION 'Пересечение периодов работы сотрудника';
-    END IF;
-    RETURN NEW;
+    RAISE NOTICE 'Триггер запущен! Удаляем назначения сотрудника %', OLD.id;
+    DELETE FROM mochalov2261.assignment WHERE employee_id = OLD.id;
+    RETURN OLD;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
-CREATE TRIGGER trg_assignment_overlap
-BEFORE INSERT OR UPDATE ON assignment
-FOR EACH ROW EXECUTE FUNCTION check_assignment_overlap();
+-- Создание триггера
+CREATE OR REPLACE TRIGGER delete_assignments_cascade_trigger
+    BEFORE DELETE ON mochalov2261.employee
+    FOR EACH ROW
+    EXECUTE FUNCTION mochalov2261.delete_assignments_cascade_function();
+
 ```
 
----
-
-# Примеры запросов и выходных документов
-
-## 1. Список работников отдела на дату
+## Проверка
 
 ```sql
-SELECT e.full_name,
-       e.birth_date,
-       e.position,
-       d.name AS department
-FROM employee e
-JOIN assignment a ON a.employee_id = e.id
-JOIN department d ON d.id = a.department_id
-WHERE d.name = :dept_name
-  AND a.start_date <= :the_date
-  AND (a.end_date IS NULL OR a.end_date >= :the_date)
-ORDER BY e.birth_date;
+-- Удаляем сотрудника с id = 1
+DELETE FROM mochalov2261.employee WHERE id = 1;
+
 ```
 
-### Пример результата
+![trig1](docs/images/trig1.png)
 
-| ФИО         | Дата рождения | Должность | Отдел   |
-| ----------- | ------------- | --------- | ------- |
-| Иванов И.И. | 1980-01-01    | инженер   | Отдел А |
-
----
-
-## 2. Сотрудники с более чем одним ребёнком + средний возраст в отделе
+## 2. Триггер каскадного удаления детей при удалении сотрудника
 
 ```sql
-SELECT d.name AS department,
-       e.full_name,
-       e.children_count,
-       DATE_PART('year', AGE(e.birth_date)) AS age
-FROM employee e
-JOIN assignment a ON a.employee_id = e.id
-JOIN department d ON d.id = a.department_id
-WHERE e.children_count > 1
-ORDER BY d.name;
+-- Функция для удаления детей сотрудника
+CREATE OR REPLACE FUNCTION mochalov2261.delete_children_cascade_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE NOTICE 'Триггер запущен! Удаляем детей сотрудника %', OLD.id;
+    DELETE FROM mochalov2261.child WHERE employee_id = OLD.id;
+    RETURN OLD;
+END;
+$$;
+
+-- Создание триггера
+CREATE OR REPLACE TRIGGER delete_children_cascade_trigger
+    BEFORE DELETE ON mochalov2261.employee
+    FOR EACH ROW
+    EXECUTE FUNCTION mochalov2261.delete_children_cascade_function();
+
 ```
 
-### Средний возраст по отделам (view)
+## 3. Создание таблицы аудита назначений
 
 ```sql
-CREATE OR REPLACE VIEW dept_avg_age AS
-SELECT d.name,
-       AVG(DATE_PART('year', AGE(e.birth_date))) AS avg_age
-FROM employee e
-JOIN assignment a ON a.employee_id = e.id
-JOIN department d ON d.id = a.department_id
-GROUP BY d.name;
+CREATE TABLE IF NOT EXISTS mochalov2261.assignment_audit(
+    audit_id SERIAL PRIMARY KEY,
+    operation CHAR(1) NOT NULL,  -- I=INSERT, U=UPDATE, D=DELETE
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    changed_by TEXT DEFAULT CURRENT_USER,
+
+    assignment_id INTEGER,
+    employee_id INTEGER,
+    department_id INTEGER,
+    start_date DATE,
+    end_date DATE
+);
+
 ```
 
----
+## 4. Функция и триггер аудита назначений
 
-# Проверка нормальных форм
+```sql
+-- Функция аудита изменений
+CREATE OR REPLACE FUNCTION mochalov2261.assignment_audit_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF (TG_OP = 'UPDATE') THEN
+        INSERT INTO mochalov2261.assignment_audit(operation, assignment_id, employee_id, department_id, start_date, end_date)
+        VALUES ('U', NEW.id, NEW.employee_id, NEW.department_id, NEW.start_date, NEW.end_date);
+        RETURN NEW;
+    ELSEIF (TG_OP = 'DELETE') THEN
+        INSERT INTO mochalov2261.assignment_audit(operation, assignment_id, employee_id, department_id, start_date, end_date)
+        VALUES ('D', OLD.id, OLD.employee_id, OLD.department_id, OLD.start_date, OLD.end_date);
+        RETURN OLD;
+    ELSEIF (TG_OP = 'INSERT') THEN
+        INSERT INTO mochalov2261.assignment_audit(operation, assignment_id, employee_id, department_id, start_date, end_date)
+        VALUES ('I', NEW.id, NEW.employee_id, NEW.department_id, NEW.start_date, NEW.end_date);
+        RETURN NEW;
+    END IF;
+END;
+$$;
 
-| НФ   | Статус | Комментарий                     |
-| ---- | ------ | ------------------------------- |
-| 1NF  | ✔      | Все атрибуты атомарны           |
-| 2NF  | ✔      | Нет зависимостей от части ключа |
-| 3NF  | ✔      | Нет транзитивных зависимостей   |
-| BCNF | ✔      | Все детерминанты — ключи        |
+-- Создание триггера аудита
+CREATE OR REPLACE TRIGGER assignment_audit_trigger
+    AFTER INSERT OR UPDATE OR DELETE ON mochalov2261.assignment
+    FOR EACH ROW
+    EXECUTE FUNCTION mochalov2261.assignment_audit_function();
 
----
+```
 
-# Эволюция проекта
+## 5. Проверка работы триггеров аудита
 
-### 1. Добавление триггера
+### 5.1 Генерация тестовых назначений
 
-Проблема пересечения периодов решена триггером `check_assignment_overlap()`.
+```sql
+CREATE OR REPLACE PROCEDURE mochalov2261.generate_test_assignments(count INTEGER)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    i INTEGER;
+    rand_employee_id INTEGER;
+    rand_department_id INTEGER;
+    rand_start DATE;
+    rand_end DATE;
+BEGIN
+    FOR i IN 1..count LOOP
+        SELECT id INTO rand_employee_id FROM mochalov2261.employee ORDER BY RANDOM() LIMIT 1;
+        SELECT id INTO rand_department_id FROM mochalov2261.department ORDER BY RANDOM() LIMIT 1;
+        rand_start := CURRENT_DATE + (FLOOR(RANDOM() * 30))::INTEGER;
+        rand_end := rand_start + (FLOOR(RANDOM() * 365))::INTEGER;
+        INSERT INTO mochalov2261.assignment(employee_id, department_id, start_date, end_date)
+        VALUES (rand_employee_id, rand_department_id, rand_start, rand_end);
+    END LOOP;
+END;
+$$;
 
-### 2. Уточнение структуры детей
+```
 
-Ребёнок связан только FK → employee.
+## 5.2 Тестирование
 
-### 3. Выделение отделов в самостоятельную таблицу
+```sql
+-- 1. Генерируем 10 тестовых назначений
+CALL mochalov2261.generate_test_assignments(10);
 
-Уникальность названия + учёт помещений.
+-- 2. Удаляем одно назначение
+DELETE FROM mochalov2261.assignment
+WHERE id = (SELECT id FROM mochalov2261.assignment ORDER BY RANDOM() LIMIT 1);
 
-### 4. Оптимизация запросов
+-- 3. Обновляем одно назначение
+UPDATE mochalov2261.assignment
+SET end_date = CURRENT_DATE + 30
+WHERE id = (SELECT id FROM mochalov2261.assignment ORDER BY id DESC LIMIT 1);
 
-Добавлены индексы по самым частым условиям фильтрации.
+```
 
----
+## 5.3 Проверка таблицы аудита
 
-# Итог
+```sql
+SELECT * FROM mochalov2261.assignment_audit ORDER BY changed_at DESC;
 
-Проект полностью реализует требования:
+SELECT
+    operation,
+    COUNT(*) AS count,
+    MIN(changed_at) AS first_operation,
+    MAX(changed_at) AS last_operation
+FROM mochalov2261.assignment_audit
+GROUP BY operation
+ORDER BY operation;
 
--   учёт сотрудников, детей, отделов;
--   хранение истории назначений без пересечений;
--   формирование требуемых отчётов;
--   нормализованная структура (BCNF);
--   оптимизация с помощью индексов и VIEW.
--   Данные были проверены при помощи валидации Deepseek, как и требовалось.
+```
 
-Последнее обновление: 2025-11-17
+![trig2](docs/images/trig2.png)
+
+## Очиста тестовых данных
+
+```sql
+-- Удаляем временную процедуру
+DROP PROCEDURE IF EXISTS mochalov2261.generate_test_assignments(INTEGER);
+
+```
+
+Последнее обновление: 2025-12-15
