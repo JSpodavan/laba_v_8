@@ -173,7 +173,7 @@ GROUP BY d.name
 ORDER BY d.name;
 ```
 
-![Запрос 1](docs/images/zapros1.png)
+![Запрос 1](docs/images/zapro1.png)
 ![Запрос 2](docs/images/zapros2.png)
 
 # Лабораторная работа №3
@@ -383,6 +383,350 @@ CALL assign_employee(1, 2, '2024-02-01', NULL);
 Результат использования процедуры assign_employee: ![call 2](docs/images/call2.png)
 
 ---
+
+# Лабораторная работа №4
+
+## Анализ производительности базы данных «Отдел кадров»
+
+---
+
+## 1. Создание генератора данных (20 000 записей в каждой таблице)
+
+Для анализа производительности SQL-запросов необходим большой объём данных.  
+В рамках лабораторной работы были созданы функции генерации случайных данных и выполнено наполнение таблиц схемы `mochalov2261`.
+
+---
+
+### Функция генерации случайного ФИО
+
+```sql
+CREATE OR REPLACE FUNCTION mochalov2261.generate_random_name()
+RETURNS VARCHAR
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    first_names TEXT[] := ARRAY[
+        'Иван','Петр','Алексей','Сергей','Андрей','Дмитрий','Михаил',
+        'Анна','Мария','Елена','Ольга','Татьяна','Наталья','Екатерина'
+    ];
+    last_names TEXT[] := ARRAY[
+        'Иванов','Петров','Сидоров','Смирнов','Кузнецов','Попов',
+        'Васильев','Федоров','Морозов','Волков','Лебедев','Семенов'
+    ];
+    patronymics TEXT[] := ARRAY[
+        'Иванович','Петрович','Алексеевич','Сергеевич','Андреевич',
+        'Дмитриевич','Михайлович','Ивановна','Петровна','Алексеевна'
+    ];
+BEGIN
+    RETURN last_names[floor(random()*array_length(last_names,1)+1)]
+        || ' ' ||
+        first_names[floor(random()*array_length(first_names,1)+1)]
+        || ' ' ||
+        patronymics[floor(random()*array_length(patronymics,1)+1)];
+END;
+$$;
+```
+
+Генерация отделов (50 записей)
+
+```sql
+INSERT INTO mochalov2261.department (name, rooms)
+SELECT
+    'Отдел №' || gs,
+    floor(random() * 10 + 1)
+FROM generate_series(1, 50) gs;
+
+```
+
+![gen1](docs/images/gen1.png)
+
+Генерация сотрудников (20 000 записей)
+
+```sql
+INSERT INTO mochalov2261.employee (
+    full_name, passport, address,
+    birth_date, gender, position, children_count
+)
+SELECT
+    mochalov2261.generate_random_name(),
+    floor(random()*9000+1000)::text || ' ' || floor(random()*900000+100000)::text,
+    'г. Москва',
+    DATE '1960-01-01' + floor(random() * 15000) * INTERVAL '1 day',
+    CASE WHEN random() > 0.5 THEN 'M' ELSE 'F' END,
+    CASE floor(random()*4)
+        WHEN 0 THEN 'Инженер'
+        WHEN 1 THEN 'Менеджер'
+        WHEN 2 THEN 'Бухгалтер'
+        ELSE 'HR'
+    END,
+    floor(random()*4)
+FROM generate_series(1, 20000);
+```
+
+![gen2](docs/images/gen2.png)
+
+Генерация назначений сотрудников
+
+```sql
+INSERT INTO mochalov2261.assignment (employee_id, department_id, start_date, end_date)
+SELECT
+    e.id,
+    floor(random()*50 + 1),
+    DATE '2010-01-01' + floor(random()*4000) * INTERVAL '1 day',
+    NULL
+FROM mochalov2261.employee e;
+
+```
+
+Выбор небольшого количества отделов позволил смоделировать реальную структуру организации и получить наглядные планы выполнения JOIN-запросов при анализе производительности.
+![gen3](docs/images/gen3.png)
+
+Проверка количества записей
+
+```sql
+SELECT 'employee' AS table_name, COUNT(*) FROM mochalov2261.employee
+UNION ALL
+SELECT 'department', COUNT(*) FROM mochalov2261.department
+UNION ALL
+SELECT 'assignment', COUNT(*) FROM mochalov2261.assignment;
+
+```
+
+![gen4](docs/images/gen4.png)
+
+## 2. Анализ планов выполнения запросов (EXPLAIN ANALYZE)
+
+**Что показывает EXPLAIN ANALYZE:**
+
+-   **Seq Scan** — последовательное чтение всей таблицы
+
+-   **Index Scan** — использование индекса
+
+-   **Hash Join** — соединение через хеш-таблицы
+
+-   **Nested Loop** — вложенные циклы
+
+-   **Sort** — операция сортировки
+
+### Исходные индексы (только PRIMARY KEY)
+
+```sql
+SELECT
+    tablename,
+    indexname,
+    indexdef
+FROM pg_indexes
+WHERE schemaname = 'mochalov2261'
+ORDER BY tablename, indexname;
+
+```
+
+![gen5](docs/images/gen5.png)
+Начальное состояние: В базе данных присутствуют только индексы первичных ключей.
+
+### Анализ запроса 1: Список сотрудников заданного отдела на дату (до оптимизации)
+
+```sql
+EXPLAIN ANALYZE
+SELECT e.full_name
+FROM mochalov2261.employee e
+JOIN mochalov2261.assignment a ON a.employee_id = e.id
+JOIN mochalov2261.department d ON d.id = a.department_id
+WHERE d.name = 'Отдел №10'
+  AND a.start_date <= DATE '2023-01-01'
+ORDER BY e.birth_date;
+```
+
+![gen6](docs/images/gen6.png)
+
+**Анализ результатов (до оптимизации):**
+
+-   **Seq Scan по таблице assignment** (20 000 строк)
+-   **Hash Join** - при соединении таблиц
+-   **Sort** - по дате рождения
+-   **Общее время: ~200 мс**
+
+### Анализ запроса 2: Сотрудники с более чем одним ребёнком (до оптимизации)
+
+```sql
+EXPLAIN ANALYZE
+SELECT d.name, e.full_name
+FROM mochalov2261.employee e
+JOIN mochalov2261.assignment a ON e.id = a.employee_id
+JOIN mochalov2261.department d ON d.id = a.department_id
+WHERE e.children_count > 1;
+
+```
+
+![gen7](docs/images/gen7.png)
+
+Seq Scan по таблице employee
+
+Hash Join
+
+Общее время выполнения: ~180 мс
+
+**Анализ результатов (до оптимизации):**
+
+-   **Seq Scan по таблице employee**
+-   **Hash Join**
+-   **Общее время выполнения: ~180 мс**
+
+**Выявленная проблема:**
+В результате анализа планов выполнения запросов с использованием EXPLAIN ANALYZE было выявлено, что оба запроса выполняются с использованием последовательного сканирования таблиц (Seq Scan).
+Это связано с отсутствием индексов по полям, используемым в условиях фильтрации и соединения таблиц.
+При увеличении объёма данных это приводит к значительному росту времени выполнения запросов и повышенной нагрузке на систему.
+
+### Анализ сложного запроса
+
+Рассмотрим сложный запрос, содержащий соединение нескольких таблиц, условия фильтрации, группировку и сортировку.
+
+Сложный запрос
+
+```sql
+EXPLAIN ANALYZE
+SELECT
+    d.name,
+    COUNT(e.id)
+FROM mochalov2261.employee e
+JOIN mochalov2261.assignment a ON e.id = a.employee_id
+JOIN mochalov2261.department d ON d.id = a.department_id
+WHERE e.children_count > 0
+GROUP BY d.name
+ORDER BY COUNT(e.id) DESC;
+
+```
+
+![gen8](docs/images/gen8.png)
+**Анализ результатов (до оптимизации):**
+
+-   **Seq Scan на assignment** - выполняется последовательное сканирование таблицы назначений из-за отсутствия индекса по department_id;
+-   **Seq Scan на employee** - таблица сотрудников читается полностью при выполнении соединения;
+-   **Hash Join** - используется хеш-соединение для связи таблиц employee и assignment;
+-   **HashAggregate** - выполняется агрегация для подсчёта количества сотрудников по отделам;
+-   **Sort** - сортировка результата по количеству сотрудников выполняется после агрегации;
+-   **Отсутствие индексов:** - по полям соединения и группировки приводит к обработке всех строк таблиц.
+-   **Общее время выполнения:** ~300–350 мс при большом объёме данных.
+
+**Проблема:**
+
+Отсутствие индексов по полям assignment.department_id и assignment.employee_id приводит к полному сканированию таблиц и неэффективному выполнению операций соединения и агрегации.
+При росте количества записей производительность запроса существенно снижается, так как все вычисления выполняются над полным набором данных.
+
+## 3. Оптимизация БД через индексы и настройки
+
+### Создание оптимизирующих индексов
+
+```sql
+CREATE INDEX idx_employee_birth_date
+ON mochalov2261.employee(birth_date);
+
+CREATE INDEX idx_employee_children
+ON mochalov2261.employee(children_count);
+
+CREATE INDEX idx_assignment_employee
+ON mochalov2261.assignment(employee_id);
+
+CREATE INDEX idx_assignment_department
+ON mochalov2261.assignment(department_id);
+
+CREATE INDEX idx_assignment_start_date
+ON mochalov2261.assignment(start_date);
+
+CREATE INDEX idx_department_name
+ON mochalov2261.department(name);
+
+```
+
+### Настройка параметров сессии
+
+```sql
+SET work_mem = '8MB';
+SET enable_seqscan = off;
+SET enable_nestloop = off;
+SET random_page_cost = 1.5;
+
+```
+
+### Сбор статистики
+
+```sql
+ANALYZE employee;
+ANALYZE assignment;
+ANALYZE department;
+
+```
+
+## 4. Сравнение производительности до и после оптимизации
+
+### Тест 1: Список сотрудников отдела (после оптимизации)
+
+```sql
+EXPLAIN ANALYZE
+SELECT e.full_name
+FROM employee e
+JOIN assignment a ON a.employee_id = e.id
+JOIN department d ON d.id = a.department_id
+WHERE d.name = 'Отдел №10'
+  AND a.start_date <= DATE '2023-01-01'
+ORDER BY e.birth_date;
+
+```
+
+![gen9](docs/images/gen9.png)
+
+**Анализ после оптимизации:**
+
+-   **Index Scan вместо Seq Scan**
+-   **Используются индексы** - idx_department_name, idx_assignment_department
+-   **Время выполнения: ~28 мс**
+-   **Ускорение: ~8 раз**
+
+### Тест 2: Сотрудники с детьми (после оптимизации)
+
+```sql
+EXPLAIN ANALYZE
+SELECT d.name, e.full_name
+FROM mochalov2261.employee e
+JOIN mochalov2261.assignment a ON e.id = a.employee_id
+JOIN mochalov2261.department d ON d.id = a.department_id
+WHERE e.children_count > 1;
+
+```
+
+![gen10](docs/images/gen10.png)
+
+**Анализ после оптимизации:**
+
+-   **Index Scan по полю children_count**
+-   **Время выполнения: ~35 мс**
+-   **Ускорение: ~5 раз**
+
+### Итоговая статистика производительности
+
+| Запрос                    | До оптимизации | После оптимизации | Ускорение |
+| ------------------------- | -------------- | ----------------- | --------- |
+| Список сотрудников отдела | ~220 мс        | ~28 мс            | 7.8x      |
+| Сотрудники с детьми       | ~180 мс        | ~35 мс            | 5.1x      |
+
+## **Выводы по влиянию оптимизации на SELECT-запросы?:**
+
+### **Индексы радикально изменяют планы выполнения запросов**
+
+-   **Seq Scan заменяется на Index Scan**
+-   **Сокращается количество операций ввода-вывода**
+-   **Ускоряется выполнение JOIN и ORDER BY**
+-   **Производительность возрастает в 5–8 раз при больших объёмах данных**
+
+## Общий вывод
+
+В ходе лабораторной работы была проведена генерация тестовых данных
+и выполнен анализ производительности запросов базы данных
+Создание индексов и настройка параметров PostgreSQL позволили
+значительно повысить скорость выполнения SELECT-запросов,
+что подтверждено результатами EXPLAIN ANALYZE.
+
+# Лабораторная №5
 
 ### Индексы
 
